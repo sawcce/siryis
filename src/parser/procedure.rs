@@ -138,7 +138,7 @@ where
     let (i, _) = ws(tag("+="))(i)?;
     let (i, (name, ns, ne)) = positioned_ws(identifier)(i)?;
     let (i, _) = opt(ws(tag(":")))(i)?;
-    let (i, (value, vs, ve)) = cut(positioned_ws(fragment_value))(i)?;
+    let (i, (value, vs, ve)) = cut(positioned_ws(fragment_value_nws))(i)?;
 
     Ok((
         i,
