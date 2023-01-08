@@ -1,16 +1,56 @@
 use super::{prelude::*, string::escaped_string};
-use nom::multi::{fold_many0, fold_many1, fold_many_m_n, separated_list0};
+use nom::{character::complete::digit1, multi::separated_list0};
+use nom_locate::position;
 
-pub(crate) fn fragment_value<'a, E>(i: &'a str) -> IResult<&'a str, Fragment, E>
+pub(crate) fn fragment_value<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Fragment, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
-    ws(alt((escaped_string, boolean, none, list)))(i)
+    ws(fragment_value_nws)(i)
 }
 
-pub(crate) fn boolean<'a, E>(i: &'a str) -> IResult<&'a str, Fragment, E>
+pub(crate) fn fragment_value_nws<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Fragment, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
+{
+    alt((escaped_string, number, boolean, none, variable, list))(i)
+}
+
+fn number<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Fragment, E>
+where
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
+{
+    let (i, sign) = opt(alt((tag("+"), tag("-"))))(i)?;
+    let sign = sign.map(|a| a.to_string()).unwrap_or("".into());
+
+    let (i, decimal) = digit1(i)?;
+    let (i, fractional) = opt(|i| {
+        let (i, _) = tag(".")(i)?;
+        digit1(i)
+    })(i)?;
+
+    let representation = match fractional {
+        Some(fractional) => format!("{sign}{decimal}.{fractional}"),
+        None => format!("{sign}{decimal}"),
+    };
+
+    let number = representation.parse::<f64>().unwrap();
+
+    Ok((i, Fragment::Number(number)))
+}
+
+fn variable<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Fragment, E>
+where
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
+{
+    let (i, ident) = identifier(i)?;
+    let (i, pos) = position(i)?;
+    Ok((i, Fragment::Variable(ident, pos)))
+}
+
+fn boolean<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Fragment, E>
+where
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
     alt((
         value(Fragment::Boolean(false), ws(tag("Lie"))),
@@ -18,16 +58,16 @@ where
     ))(i)
 }
 
-pub(crate) fn none<'a, E>(i: &'a str) -> IResult<&'a str, Fragment, E>
+fn none<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Fragment, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
-    value(Fragment::None, ws(tag("None")))(i)
+    value(Fragment::None, tag("None"))(i)
 }
 
-pub(crate) fn list<'a, E>(i: &'a str) -> IResult<&'a str, Fragment, E>
+fn list<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Fragment, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
     map(
         delimited(

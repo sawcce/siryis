@@ -1,0 +1,25 @@
+{
+  "name": "siryis",
+  "displayName": "Siryis",
+  "description": "Syntax highlighting for the siryis language",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [{
+      "id": "siryis",
+      "aliases": ["Siryis", "siryis"],
+      "extensions": [".srs",".siryis",".sr",".sir"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "siryis",
+      "scopeName": "source.siryis",
+      "path": "./syntaxes/siryis.tmLanguage.json"
+    }]
+  }
+}

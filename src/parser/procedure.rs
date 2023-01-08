@@ -1,18 +1,23 @@
 use nom::multi::{many0, many1, separated_list1};
+use nom_locate::position;
 
-use super::prelude::*;
+use super::{prelude::*, value::fragment_value_nws, ws::positioned_ws};
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Procedure {
+pub(crate) struct Procedure<'a> {
     pub(crate) name: String,
-    pub(crate) body: Vec<Instruction>,
+    pub(crate) args: Vec<String>,
+    pub(crate) body: Vec<Instruction<'a>>,
+    pub(crate) name_span: Span<'a>,
 }
 
-impl Procedure {
-    pub(crate) fn named(name: &str) -> Self {
+impl<'a> Procedure<'a> {
+    /*  pub(crate) fn named(name: &str) -> Self {
         Self {
             name: name.into(),
             body: Vec::new(),
+            args: Vec::new(),
+            name_span: Span::<'a>::new(name)
         }
     }
 
@@ -20,68 +25,94 @@ impl Procedure {
         Self {
             name: name.into(),
             body,
+            args: Vec::new(),
+            name_span: Span::new(name)
         }
-    }
+    } */
 }
 
-pub(crate) fn procedure<'a, E>(i: &'a str) -> IResult<&'a str, Procedure, E>
+pub(crate) fn procedure<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Procedure, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
     let (i, _) = ws(tag("procedure"))(i)?;
     let (i, name) = cut(identifier)(i)?;
-    let (i, body) = opt(many0(instruction))(i)?;
+    let (i, name_span) = position(i)?;
+
+    let (i, args) = opt(|i| {
+        let (i, _) = ws(tag("needs"))(i)?;
+        separated_list1(tag(","), identifier)(i)
+    })(i)?;
+
+    let (i, body) = many0(instruction)(i)?;
+
+    let args = args.unwrap_or_default();
 
     Ok((
         i,
         Procedure {
             name: name.to_string(),
-            body: body.unwrap_or(Vec::new()),
+            body,
+            args,
+            name_span,
         },
     ))
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Instruction {
-    Call(Call),
-    Assignment(Assignment),
+pub(crate) enum Instruction<'a> {
+    Return(Fragment<'a>),
+    Call(Call<'a>),
+    Assignment(Assignment<'a>),
+    Increment(Increment<'a>),
+    Pipe(String, Call<'a>),
+    Match(Fragment<'a>, Vec<(Fragment<'a>, Vec<Instruction<'a>>)>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Call {
+pub(crate) struct Call<'a> {
     pub(crate) name: String,
-    pub(crate) arguments: Vec<Fragment>,
+    pub(crate) arguments: Vec<Fragment<'a>>,
+    pub(crate) spans: Spans<'a>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Assignment {
+pub(crate) struct Assignment<'a> {
     pub(crate) name: String,
-    pub(crate) value: Fragment,
+    pub(crate) value: Fragment<'a>,
 }
 
-impl Call {
-    pub(crate) fn with_arguments(name: &str, arguments: Vec<Fragment>) -> Self {
-        Self {
-            name: name.into(),
-            arguments,
-        }
-    }
-}
-
-fn instruction<'a, E>(i: &'a str) -> IResult<&'a str, Instruction, E>
+fn instruction<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Instruction, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
-    let (i, _) = ws(tag("->"))(i)?;
-    alt((assignment, call))(i)
+    alt((
+        send_back,
+        increment,
+        assignment,
+        pipe_call,
+        matcher,
+        map(call, |call| Instruction::Call(call)),
+    ))(i)
 }
 
-fn assignment<'a, E>(i: &'a str) -> IResult<&'a str, Instruction, E>
+fn send_back<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Instruction, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
-    let (i, name) = ws(identifier)(i)?;
+    let (i, _) = ws(tag("<-"))(i)?;
+    let (i, value) = ws(fragment_value)(i)?;
+
+    Ok((i, Instruction::Return(value)))
+}
+
+fn assignment<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Instruction, E>
+where
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
+{
     let (i, _) = ws(tag("="))(i)?;
+    let (i, name) = identifier(i)?;
+    let (i, _) = ws(tag(":"))(i)?;
     let (i, value) = cut(ws(fragment_value))(i)?;
 
     Ok((
@@ -93,26 +124,99 @@ where
     ))
 }
 
-fn call<'a, E>(i: &'a str) -> IResult<&'a str, Instruction, E>
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Increment<'a> {
+    pub(crate) name: String,
+    pub(crate) value: Fragment<'a>,
+    pub(crate) spans: Spans<'a>,
+}
+
+fn increment<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Instruction, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
-    let (i, name) = ws(identifier)(i)?;
-    let (i, arguments) = opt(args)(i)?;
+    let (i, _) = ws(tag("+="))(i)?;
+    let (i, (name, ns, ne)) = positioned_ws(identifier)(i)?;
+    let (i, _) = opt(ws(tag(":")))(i)?;
+    let (i, (value, vs, ve)) = cut(positioned_ws(fragment_value))(i)?;
 
     Ok((
         i,
-        Instruction::Call(Call {
+        Instruction::Increment(Increment {
             name: name.into(),
-            arguments: arguments.unwrap_or(Vec::new()),
+            value,
+            spans: vec![ns, ne, vs, ve],
         }),
     ))
 }
 
-fn args<'a, E>(i: &'a str) -> IResult<&'a str, Vec<Fragment>, E>
+fn matcher<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Instruction, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
+{
+    let (i, _) = ws(tag("?"))(i)?;
+    let (i, value) = cut(fragment_value)(i)?;
+    let (i, _) = ws(cut(tag(":")))(i)?;
+
+    let (i, branches) = cut(many1(branch))(i)?;
+    let branches = branches.into_iter().flatten().collect();
+
+    let (i, _) = cut(ws(tag("End")))(i)?;
+
+    Ok((i, Instruction::Match(value, branches)))
+}
+
+fn branch<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Vec<(Fragment, Vec<Instruction>)>, E>
+where
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
+{
+    let (i, values) = separated_list1(tag(","), fragment_value)(i)?;
+    let (i, instructions) = many0(instruction)(i)?;
+
+    let branches = values
+        .iter()
+        .map(|value| (value.clone(), instructions.clone()))
+        .collect();
+
+    Ok((i, branches))
+}
+
+fn pipe_call<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Instruction, E>
+where
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
+{
+    let (i, call) = call(i)?;
+    let (i, _) = ws(tag("=>"))(i)?;
+    let (i, name) = identifier(i)?;
+
+    Ok((i, Instruction::Pipe(name.to_string(), call)))
+}
+
+fn call<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Call, E>
+where
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
+{
+    let (i, _) = ws(tag("->"))(i)?;
+    let (i, (name, ns, ne)) = positioned_ws(identifier)(i)?;
+    let (i, bvs) = position(i)?;
+    let (i, result) = opt(args)(i)?;
+    let (i, bve) = position(i)?;
+    let (arguments, vs, ve) = result.unwrap_or((Vec::new(), bvs, bve));
+
+    Ok((
+        i,
+        Call {
+            name: name.into(),
+            arguments,
+            spans: vec![ns, ne, vs, ve],
+        },
+    ))
+}
+
+fn args<'a, E>(i: Span<'a>) -> IResult<Span<'a>, (Vec<Fragment>, Span<'a>, Span<'a>), E>
+where
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
     let (i, _) = ws(tag(":"))(i)?;
-    cut(separated_list1(tag(","), fragment_value))(i)
+    positioned_ws(cut(separated_list1(ws(tag(",")), fragment_value_nws)))(i)
 }

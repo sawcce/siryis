@@ -12,14 +12,14 @@ use nom::character::complete::char;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StringFragment<'a> {
-    Literal(&'a str),
+    Literal(Span<'a>),
     EscapedChar(char),
     EscapedWS,
 }
 
-fn parse_unicode<'a, E>(input: &'a str) -> IResult<&'a str, char, E>
+/* fn parse_unicode<'a, E>(input: Span<'a>) -> IResult<Span<'a>, char, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
     // `take_while_m_n` parses between `m` and `n` bytes (inclusive) that match
     // a predicate. `parse_hex` here parses between 1 and 6 hexadecimal numerals.
@@ -45,18 +45,18 @@ where
     // not all u32 values are valid unicode code points, we have to fallibly
     // convert to char with from_u32.
     map_opt(parse_u32, std::char::from_u32)(input)
-}
+} */
 
-fn parse_escaped_char<'a, E>(input: &'a str) -> IResult<&'a str, char, E>
+fn parse_escaped_char<'a, E>(input: Span<'a>) -> IResult<Span<'a>, char, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
     preceded(
         char('\\'),
         // `alt` tries each parser in sequence, returning the result of
         // the first successful match
         alt((
-            parse_unicode,
+            // // parse_unicode,
             // The `value` parser returns a fixed value (the first argument) if its
             // parser (the second argument) succeeds. In these cases, it looks for
             // the marker characters (n, r, t, etc) and returns the matching
@@ -74,7 +74,7 @@ where
 }
 
 /// Parse a non-empty block of text that doesn't include \ or "
-fn parse_literal<'a, E: ParseError<&'a str>>(input: &'a str) -> IResult<&'a str, &'a str, E> {
+fn parse_literal<'a, E: ParseError<Span<'a>>>(input: Span<'a>) -> IResult<Span<'a>, Span<'a>, E> {
     // `is_not` parses a string of 0 or more characters that aren't one of the
     // given characters.
     let not_quote_slash = is_not("\"\\");
@@ -83,12 +83,12 @@ fn parse_literal<'a, E: ParseError<&'a str>>(input: &'a str) -> IResult<&'a str,
     // the parser. The verification function accepts out output only if it
     // returns true. In this case, we want to ensure that the output of is_not
     // is non-empty.
-    verify(not_quote_slash, |s: &str| !s.is_empty())(input)
+    verify(not_quote_slash, |s: &Span| !s.is_empty())(input)
 }
 
-fn parse_fragment<'a, E>(input: &'a str) -> IResult<&'a str, StringFragment<'a>, E>
+fn parse_fragment<'a, E>(input: Span<'a>) -> IResult<Span<'a>, StringFragment<'a>, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
     alt((
         // The `map` combinator runs a parser, then applies a function to the output
@@ -101,22 +101,22 @@ where
 
 /// Parse a backslash, followed by any amount of whitespace. This is used later
 /// to discard any escaped whitespace.
-fn parse_escaped_whitespace<'a, E: ParseError<&'a str>>(
-    input: &'a str,
-) -> IResult<&'a str, &'a str, E> {
+fn parse_escaped_whitespace<'a, E: ParseError<Span<'a>>>(
+    input: Span<'a>,
+) -> IResult<Span<'a>, Span<'a>, E> {
     preceded(char('\\'), multispace1)(input)
 }
 
-pub(crate) fn escaped_string<'a, E>(i: &'a str) -> IResult<&'a str, Fragment, E>
+pub(crate) fn escaped_string<'a, E>(i: Span<'a>) -> IResult<Span<'a>, Fragment, E>
 where
-    E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    E: ParseError<Span<'a>> + FromExternalError<Span<'a>, std::num::ParseIntError>,
 {
     delimited(
         char('"'),
         map(
             fold_many1(parse_fragment, String::new, |mut string, fragment| {
                 match fragment {
-                    StringFragment::Literal(s) => string.push_str(s),
+                    StringFragment::Literal(s) => string.push_str(&s.to_string()),
                     StringFragment::EscapedChar(c) => string.push(c),
                     StringFragment::EscapedWS => {}
                 }

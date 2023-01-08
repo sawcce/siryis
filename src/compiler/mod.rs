@@ -1,15 +1,17 @@
 use std::{
     collections::HashMap,
     fmt::Display,
-    ops::Deref,
+    ops::{Deref, Range},
     sync::{Arc, Mutex},
 };
 
 use crate::parser::{
     procedure::{Assignment, Call, Instruction, Procedure},
-    Span,
+    Span, Spans,
 };
+use ariadne::{Color, ColorGenerator, Label, Report, Source};
 use clap::builder::Str;
+use nom::{Offset, Slice};
 use zub::{
     ir::{BinaryOp, Binding, Expr, ExprNode, IrBuilder, Literal, Node, TypeInfo},
     vm::Value,
@@ -34,8 +36,21 @@ pub(crate) enum Error {
 }
 
 impl Error {
-    fn spanned(self, span: Span) -> CompileError {
-        CompileError { error: self, span }
+    fn spanned<'a>(self, spans: Spans<'a>) -> CompileError<'a> {
+        CompileError { error: self, spans }
+    }
+
+    fn code(&self) -> u8 {
+        match self {
+            Error::VariableNotFound(_) => 10,
+            Error::TypeError { expected, got } => 20,
+            Error::CallTypeError {
+                name,
+                expected,
+                got,
+            } => 30,
+            Error::CallToNonFunction(_, _) => 40,
+        }
     }
 }
 
@@ -57,9 +72,83 @@ impl Display for Error {
 }
 
 #[derive(Clone, Debug)]
-struct CompileError<'a> {
+pub(crate) struct CompileError<'a> {
     error: Error,
-    span: Span<'a>,
+    spans: Spans<'a>,
+}
+
+impl<'a> CompileError<'a> {
+    pub(crate) fn range_from(&self, index: usize) -> Range<usize> {
+        let start = self.spans.get(index).unwrap().location_offset();
+        let end = self.spans.get(index + 1).unwrap().location_offset();
+        start..end
+    }
+}
+
+pub(crate) fn show_report<'a>(errors: Vec<CompileError<'a>>, path: &str, source: &String) {
+    let mut colors = ColorGenerator::new();
+    let a = colors.next();
+    let b = colors.next();
+    let out = Color::Fixed(81);
+
+    for error in errors {
+        let mut builder = Report::build(ariadne::ReportKind::Error, path, 0)
+            .with_code(error.error.code())
+            .with_message(format!("Error: {}", error.error));
+
+        builder =
+            match error.error {
+                Error::VariableNotFound(ref name) => {
+                    let range = error.range_from(0);
+
+                    builder.with_label(Label::new((path, range)).with_color(a).with_message(
+                        format!("Variable \"{name}\" does not exist in current scope"),
+                    ))
+                }
+                Error::CallTypeError {
+                    ref name,
+                    ref expected,
+                    ref got,
+                } => {
+                    let name_r = error.range_from(0);
+                    let value_r = error.range_from(2);
+
+                    builder
+                        .with_label(
+                            Label::new((path, name_r))
+                                .with_color(a)
+                                .with_message(format!(
+                                    "Function \"{name}\" has a type signature of {expected:?}"
+                                )),
+                        )
+                        .with_label(Label::new((path, value_r)).with_color(b).with_message(
+                            format!("And arguments have a type signature of {got:?}"),
+                        ))
+                }
+                Error::TypeError {
+                    ref expected,
+                    ref got,
+                } => {
+                    let got_r = error.range_from(0);
+
+                    builder
+                        .with_label(
+                            Label::new((path, got_r))
+                                .with_color(a)
+                                .with_message(format!("Got type signature of: {got:?}")),
+                        )
+                        .with_note(format!("Expected type signature of: {expected:?}"))
+                        .with_help(match got {
+                            Type::String => "Try using the built-in \"Append\" function with the pipe operator",
+                            _ => "Try changing the type of this to a number"
+                        })
+                }
+                Error::CallToNonFunction(_, _) => todo!(),
+            };
+
+        let report = builder.finish();
+        report.print((path, Source::from(source))).unwrap();
+    }
 }
 
 type SirisResult<'a, T> = Result<T, CompileError<'a>>;
@@ -182,10 +271,10 @@ impl<'b> Compiler<'b> {
             .insert(name.to_string(), Type::function(args, return_type));
     }
 
-    pub(crate) fn procedure(
+    pub(crate) fn procedure<'a, 'p>(
         &mut self,
-        procedure: &Procedure,
-    ) -> Result<Node<Expr>, Vec<CompileError>> {
+        procedure: &'p Procedure<'a>,
+    ) -> Result<Node<Expr>, Vec<CompileError<'a>>> {
         let binding = Binding {
             name: procedure.name.clone(),
             depth: None,
@@ -219,7 +308,7 @@ impl<'b> Compiler<'b> {
                 let compiled = compiler.instruction(&instruction);
                 if compiled.is_err() {
                     let err = compiled.err();
-                    errors.push(err.unwrap());
+                    errors.push(err.unwrap().clone());
                     continue;
                 }
 
@@ -263,10 +352,10 @@ impl<'b> Compiler<'b> {
         Ok(ret)
     }
 
-    pub(crate) fn instruction(
+    pub(crate) fn instruction<'l, 'x>(
         &mut self,
-        instruction: &Instruction,
-    ) -> SirisResult<Option<Node<Expr>>> {
+        instruction: &'l Instruction<'x>,
+    ) -> SirisResult<'x, Option<Node<Expr>>> {
         match instruction {
             Instruction::Assignment(assignment) => {
                 self.assignment(&assignment);
@@ -275,7 +364,7 @@ impl<'b> Compiler<'b> {
             Instruction::Pipe(name, call) => {
                 let (args, ret) = self.verify_call_correctness(call)?;
 
-                let node = self.call(&call, args, ret.clone());
+                let node = self.call(call, args, ret.clone());
                 self.insert_local(name.clone(), *ret);
 
                 let binding = Binding::local(&name, self.values.len(), 0);
@@ -285,7 +374,7 @@ impl<'b> Compiler<'b> {
             }
             Instruction::Call(call) => {
                 let (args, ret) = self.verify_call_correctness(call)?;
-                Ok(Some(self.call(&call, args, ret)?))
+                Ok(Some(self.call(call, args, ret)?))
             }
             Instruction::Match(value, branches) => {
                 let value = self.fragment(&value)?;
@@ -293,28 +382,54 @@ impl<'b> Compiler<'b> {
                 //println!("{a:?}");
                 Ok(Some(a))
             }
-            Instruction::Increment(name, value) => {
-                let binding = Binding::local(&name, spanned(self.resolve_variable(name.clone()), )?.0, 1);
+            Instruction::Increment(increment) => {
+                let (depth, type_v) = spanned(
+                    self.resolve_variable(increment.name.clone()),
+                    increment.spans.clone(),
+                )?;
+
+                if type_v != Type::Number {
+                    return Err(CompileError {
+                        error: Error::TypeError {
+                            expected: Type::Number,
+                            got: type_v,
+                        },
+                        spans: increment.spans.clone(),
+                    });
+                } 
+
+                let binding = Binding::local(&increment.name, depth, 1);
                 let var = self.builder.var(binding);
-                let increment = self.fragment(value)?;
-                let operation = self.builder.binary(var.clone(), BinaryOp::Add, increment);
+                let increment_value = self.fragment(&increment.value)?;
+
+                let span = (&increment.spans[2..4]).clone().to_vec();
+                let type_v = spanned(self.get_type(increment.value.clone()), span.clone())?;
+                if type_v != Type::Number {
+                    return Err(CompileError {
+                        error: Error::TypeError {
+                            expected: Type::Number,
+                            got: type_v,
+                        },
+                        spans: span,
+                    });
+                } 
+
+                let operation = self.builder.binary(var.clone(), BinaryOp::Add, increment_value);
                 self.builder.mutate(var, operation);
                 Ok(None)
             }
             Instruction::Return(value) => {
-                let value = self.fragment(value)?;
+                let value = self.fragment(&value)?;
                 Ok(Some(self.builder.ret_(Some(value))))
             }
-            a => panic!("Unexpected: {a:?}"),
         }
     }
 
-    fn branches(
+    fn branches<'l, 'a>(
         &mut self,
         compare: &Node<Expr>,
-        branches: &mut core::slice::Iter<(Fragment, Vec<Instruction>)>,
-    ) -> SirisResult<Node<Expr>> {
-        println!("Branches!");
+        branches: &mut core::slice::Iter<'_, (Fragment<'a>, Vec<Instruction<'a>>)>,
+    ) -> SirisResult<'a, Node<Expr>> {
         let current = branches.nth(0).unwrap();
         let value = self.fragment(&current.0)?;
 
@@ -343,8 +458,8 @@ impl<'b> Compiler<'b> {
         //self.builder.if_(cmp, Box::new(truthy), Some(Self::elsy))
     }
 
-    fn assignment(&mut self, assignment: &Assignment) -> SirisResult<()> {
-        let var_type = self.get_type(&assignment.value)?;
+    fn assignment<'a>(&mut self, assignment: &'a Assignment<'a>) -> SirisResult<'a, ()> {
+        let var_type = spanned(self.get_type(assignment.value.clone()), vec![Span::new("")])?;
 
         self.insert_local(assignment.name.to_string(), var_type);
 
@@ -361,14 +476,17 @@ impl<'b> Compiler<'b> {
         map.lock().unwrap().insert(name.clone(), var_type);
     }
 
-    fn verify_call_correctness(&mut self, call: &Call) -> SirisResult<(Vec<Type>, Box<Type>)> {
-        let (_, f_type) = self.resolve_variable(call.name.clone(), call.location)?;
+    fn verify_call_correctness<'a, 'l>(
+        &mut self,
+        call: &'l Call<'a>,
+    ) -> SirisResult<'a, (Vec<Type>, Box<Type>)> {
+        let (_, f_type) = spanned(self.resolve_variable(call.name.clone()), call.spans.clone())?;
 
         let result = match f_type {
             Type::Function(arguments, return_type) => (arguments, return_type),
             _ => {
                 return Err(
-                    Error::CallToNonFunction(call.name.clone(), f_type).spanned(call.location)
+                    Error::CallToNonFunction(call.name.clone(), f_type).spanned(call.spans.clone())
                 );
             }
         };
@@ -376,21 +494,26 @@ impl<'b> Compiler<'b> {
         Ok(result)
     }
 
-    fn call(&mut self, call: &Call, args: Vec<Type>, ret: Box<Type>) -> SirisResult<Node<Expr>> {
+    fn call<'z, 'a>(
+        &mut self,
+        call: &'z Call<'a>,
+        args: Vec<Type>,
+        ret: Box<Type>,
+    ) -> SirisResult<'a, Node<Expr>> {
         let binding = Binding::global(&call.name);
 
         let variable = self.builder.var(binding);
 
         let mut types = Vec::new();
+        let mut arguments = Vec::new();
 
-        let arguments = call
-            .arguments
-            .iter()
-            .map(|argument| {
-                types.push(spanned(self.get_type(argument), call.location)?);
-                self.fragment(argument)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        for argument in call.arguments.clone() {
+            types.push(spanned(
+                self.get_type(argument.clone()),
+                call.spans.clone(),
+            )?);
+            arguments.push(self.fragment(&argument)?);
+        }
 
         if args != types {
             return Err(Error::CallTypeError {
@@ -398,25 +521,15 @@ impl<'b> Compiler<'b> {
                 expected: args,
                 got: types,
             }
-            .spanned(call.location));
+            .spanned(call.spans.clone()));
         }
 
         Ok(self.builder.call(variable, arguments, None))
     }
 
-    fn fragment(&mut self, fragment: &Fragment) -> SirisResult<Node<Expr>> {
+    fn fragment<'a, 'l>(&mut self, fragment: &'l Fragment<'a>) -> SirisResult<'a, Node<Expr>> {
         match fragment {
-            Fragment::Variable(name, span) => {
-                let depth = spanned(self.resolve_variable(name.to_string()), *span)?.0;
-
-                let binding = if depth == 0 {
-                    Binding::global(name)
-                } else {
-                    Binding::local(name, depth, 1)
-                };
-
-                Ok(self.builder.var(binding))
-            }
+            Fragment::Variable(name, span) => Ok(self.fragment_var(name, span)?.0),
             Fragment::Boolean(value) => Ok(self.builder.bool(*value)),
             Fragment::None => Ok(Expr::Literal(Literal::Nil).node(TypeInfo::new(PType::Nil))),
             Fragment::Number(number) => Ok(self.builder.number(*number)),
@@ -432,6 +545,22 @@ impl<'b> Compiler<'b> {
         }
     }
 
+    fn fragment_var<'a>(
+        &mut self,
+        name: &String,
+        span: &Span<'a>,
+    ) -> SirisResult<'a, (ExprNode, Span<'a>)> {
+        let depth = spanned(self.resolve_variable(name.to_string()), vec![*span])?.0;
+
+        let binding = if depth == 0 {
+            Binding::global(name)
+        } else {
+            Binding::local(name, depth, 1)
+        };
+
+        Ok((self.builder.var(binding), *span))
+    }
+
     fn resolve_variable(&mut self, name: String) -> Result<(usize, Type), Error> {
         let iterator = self.values.iter().rev();
         for (i, map) in iterator.enumerate() {
@@ -440,24 +569,22 @@ impl<'b> Compiler<'b> {
             }
         }
 
-        println!("Not found! {name}");
         Err(Error::VariableNotFound(name))
     }
 
-    fn get_type(&mut self, fragment: &Fragment) -> Result<Type, Error> {
+    fn get_type<'a>(&mut self, fragment: Fragment<'a>) -> Result<Type, Error> {
         Ok(match fragment {
             Fragment::Number(_) => Type::Number,
             Fragment::Boolean(_) => Type::Boolean,
             Fragment::List(_) => Type::list(Type::Any),
             Fragment::None => Type::None,
             Fragment::String(_) => Type::String,
-            Fragment::Variable(name) => self.resolve_variable(name.clone())?.1,
-            t => Type::Unknown,
+            Fragment::Variable(name, _) => self.resolve_variable(name.clone())?.1,
         })
     }
 }
 
-fn spanned<T>(result: Result<T, Error>, span: Span) -> SirisResult<T> {
+fn spanned<'a, T>(result: Result<T, Error>, span: Spans<'a>) -> SirisResult<'a, T> {
     match result {
         Ok(value) => Ok(value),
         Err(error) => Err(error.spanned(span)),

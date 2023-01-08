@@ -1,12 +1,15 @@
 [package]
+edition = "2021"
 name = "siryis"
 version = "0.1.0"
-edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = { version = "4.0.32", features = ["derive"] }
+ariadne = "0.1.5"
+clap = {version = "4.0.32", features = ["derive"]}
 nom = "7.1.2"
 nom-unicode = "0.3.0"
-zub = "0.3.14"
+nom_locate = "4.0.0"
+rand = "0.8.5"
+zub = {path = "D:/Development/Repositories/Zub"}
