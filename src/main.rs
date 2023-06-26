@@ -1,44 +1,51 @@
 #![deny(rust_2018_idioms)]
+#![feature(result_option_inspect)]
+
+use std::io;
 
 use clap::{Parser, Subcommand};
-
 
 mod compiler;
 mod parser;
 mod run;
+mod project;
 use run::run;
 
 #[derive(Subcommand, Debug)]
+#[command(name = "Action")]
 enum Command {
     #[command(about = "Runs the siryis project at current location")]
-    Run,
+    Run {
+        root: Option<String>,
+    },
+    Init {
+        target: Option<String>,
+    },
     Build,
-    Init,
 }
 
 #[derive(Parser, Debug)]
 #[command(author = "Sawcce", version = "0.0.1", about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value_t = (".".into()))]
-    root: String,
     #[command(subcommand)]
     command: Command,
 }
 
-fn main() {
+fn main() -> io::Result<()> {
     let args = Args::parse();
 
     match args.command {
+        Command::Init { target } => {
+            println!("Creating new project at: {:?}", target);
+        }
         Command::Build => {
             todo!()
         }
-        Command::Init => {
-            todo!()
-        }
-        Command::Run => {run(args.root)}
+        Command::Run { root } => run(root.unwrap_or(".".into()))?,
     }
-}
 
+    Ok(())
+}
 
 #[cfg(test)]
 mod test;

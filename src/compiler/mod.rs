@@ -9,15 +9,15 @@ use crate::parser::{
     procedure::{Assignment, Call, Instruction, Procedure},
     Span, Spans,
 };
-use ariadne::{Color, ColorGenerator, Label, Report, Source};
+use ariadne::{Color, ColorGenerator, Fmt, Label, Report, Source};
 use clap::builder::Str;
 use nom::{Offset, Slice};
-use zub::{
+use zubbers::{
     ir::{BinaryOp, Binding, Expr, ExprNode, IrBuilder, Literal, Node, TypeInfo},
     vm::Value,
 };
 
-type PType = zub::ir::Type;
+type PType = zubbers::ir::Type;
 use super::parser::Fragment;
 
 #[derive(Clone, Debug)]
@@ -92,9 +92,9 @@ pub(crate) fn show_report<'a>(errors: Vec<CompileError<'a>>, path: &str, source:
     let out = Color::Fixed(81);
 
     for error in errors {
-        let mut builder = Report::build(ariadne::ReportKind::Error, path, 0)
+        let mut builder = Report::build(ariadne::ReportKind::Error, path, error.spans.get(0).unwrap().location_offset())
             .with_code(error.error.code())
-            .with_message(format!("Error: {}", error.error));
+            .with_message(format!("{}", error.error));
 
         builder =
             match error.error {
@@ -102,7 +102,10 @@ pub(crate) fn show_report<'a>(errors: Vec<CompileError<'a>>, path: &str, source:
                     let range = error.range_from(0);
 
                     builder.with_label(Label::new((path, range)).with_color(a).with_message(
-                        format!("Variable \"{name}\" does not exist in current scope"),
+                        format!(
+                            "Variable \"{}\" does not exist in current scope",
+                            name.fg(out)
+                        ),
                     ))
                 }
                 Error::CallTypeError {
@@ -118,7 +121,8 @@ pub(crate) fn show_report<'a>(errors: Vec<CompileError<'a>>, path: &str, source:
                             Label::new((path, name_r))
                                 .with_color(a)
                                 .with_message(format!(
-                                    "Function \"{name}\" has a type signature of {expected:?}"
+                                    "Function \"{}\" has a type signature of {expected:?}",
+                                    name.fg(out)
                                 )),
                         )
                         .with_label(Label::new((path, value_r)).with_color(b).with_message(
@@ -139,8 +143,14 @@ pub(crate) fn show_report<'a>(errors: Vec<CompileError<'a>>, path: &str, source:
                         )
                         .with_note(format!("Expected type signature of: {expected:?}"))
                         .with_help(match got {
-                            Type::String => "Try using the built-in \"Append\" function with the pipe operator",
-                            _ => "Try changing the type of this to a number"
+                            Type::String => format!(
+                                "Try using the built-in \"{}\" function with the pipe operator",
+                                "Append".fg(out)
+                            ),
+                            _ => format!(
+                                "Try changing the type of this to a {}",
+                                format!("{expected:?}").fg(out)
+                            ),
                         })
                 }
                 Error::CallToNonFunction(_, _) => todo!(),
@@ -154,7 +164,6 @@ pub(crate) fn show_report<'a>(errors: Vec<CompileError<'a>>, path: &str, source:
 type SirisResult<'a, T> = Result<T, CompileError<'a>>;
 
 #[derive(Clone)]
-#[repr(u8)]
 pub(crate) enum Type {
     List(Box<Type>),
     Function(Vec<Type>, Box<Type>),
@@ -170,7 +179,7 @@ impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
         use Type::*;
 
-        if let Any = other {
+        if matches!(other, Any) || matches!(other, Unknown) {
             return true;
         }
 
@@ -190,12 +199,16 @@ impl PartialEq for Type {
                 }
             }
             Any => true,
-            Unknown => matches!(other, Unknown),
+            Unknown => true,
             String => matches!(other, String),
             Boolean => matches!(other, Boolean),
             Number => matches!(other, Number),
             None => matches!(other, None),
         }
+    }
+
+    fn ne(&self, other: &Self) -> bool {
+        !self.eq(other)
     }
 }
 
@@ -204,7 +217,7 @@ impl Type {
         Self::List(Box::new(inner))
     }
 
-    fn function(arguments: Vec<Type>, return_type: Type) -> Self {
+    pub(crate) fn function(arguments: Vec<Type>, return_type: Type) -> Self {
         Self::Function(arguments, Box::new(return_type))
     }
 }
@@ -396,7 +409,7 @@ impl<'b> Compiler<'b> {
                         },
                         spans: increment.spans.clone(),
                     });
-                } 
+                }
 
                 let binding = Binding::local(&increment.name, depth, 1);
                 let var = self.builder.var(binding);
@@ -412,9 +425,11 @@ impl<'b> Compiler<'b> {
                         },
                         spans: span,
                     });
-                } 
+                }
 
-                let operation = self.builder.binary(var.clone(), BinaryOp::Add, increment_value);
+                let operation = self
+                    .builder
+                    .binary(var.clone(), BinaryOp::Add, increment_value);
                 self.builder.mutate(var, operation);
                 Ok(None)
             }

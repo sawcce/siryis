@@ -9,7 +9,7 @@ pub(crate) fn identifier<'a, E: ParseError<Span<'a>>>(i: Span<'a>) -> IResult<Sp
         .map(|value| String::from(value.to_string().clone()))
         .collect::<String>();
 
-    if(identifier == "End") {
+    if identifier == "End" {
         return Err(Err::Error(ParseError::from_char(i, 'E')))
     }
 

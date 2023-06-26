@@ -1,30 +1,39 @@
-use crate::compiler::{Error, Type, show_report};
+use crate::compiler::{show_report, Type};
 use crate::parser::Span;
-use crate::parser::procedure::procedure;
-use crate::{compiler::Compiler, parser::module::module};
-use nom::error::VerboseError;
-use rand::{thread_rng, Rng};
 
-use std::borrow::Borrow;
+use crate::project::parse_project;
+use crate::{compiler::Compiler, parser::module::module};
+
+use rand::{thread_rng, Rng};
+use zubbers::vm::{Function, CallContext};
+
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fs::read_to_string, time::Instant};
-use zub::{
-    ir::{Binding, IrBuilder},
+use zubbers::{
+    ir::IrBuilder,
     vm::{Heap, Object, Value, VM},
 };
 
-pub fn run(root: String) {
+pub fn run(root: String) -> io::Result<()> {
+    let project = parse_project(&root);
+
+    println!(
+        "Running: {}, version {}",
+        project.data.name, project.data.version
+    );
+
     let start = Instant::now();
     let root = Path::new(&root);
+    let main = root.join(Path::new("src/main.srs"));
 
-    let main = root.join(Path::new("main.srs"));
+    let code = read_to_string(&main)
+        .inspect_err(|_e| eprintln!("Could not open file {}", main.to_str().unwrap()))?;
 
-    let code = read_to_string(main).unwrap();
     let input = Span::new(&code);
     let (i, module) = module::<nom::error::Error<Span<'_>>>(input).unwrap();
     let body = module.body;
-    println!("{i} {body:?}");
 
     let builder = &mut IrBuilder::new();
     let mut compiler = Compiler::new(builder);
@@ -33,7 +42,14 @@ pub fn run(root: String) {
     compiler.add_method("Debug", vec![Type::list(Type::Any)], Type::None);
     compiler.add_method("EnableDebug", vec![Type::Boolean], Type::None);
     compiler.add_method("Random", vec![Type::Number, Type::Number], Type::Number);
-
+    compiler.add_method(
+        "Foreach",
+        vec![
+            Type::function(vec![Type::Any], Type::None),
+            Type::list(Type::Any),
+        ],
+        Type::None,
+    );
 
     /* let index = body.iter().position(|el| el.name == "Lifecycle").unwrap();
     let lifecycle = body.get(index);
@@ -60,13 +76,12 @@ pub fn run(root: String) {
     }
 
     if errors.len() > 0 {
-
         let path = Path::new("main.srs");
         let path = root.join(path);
 
         show_report(errors, path.to_str().unwrap(), &code);
 
-        return;
+        return Ok(());
     }
 
     let mut vm = VM::new();
@@ -75,6 +90,7 @@ pub fn run(root: String) {
     vm.add_native("Debug", debug, 1);
     vm.add_native("Say", print, 1);
     vm.add_native("Random", random, 2);
+    vm.add_native("Foreach", foreach, 2);
 
     let built = builder.build();
     //println!("{built:?}");
@@ -84,22 +100,26 @@ pub fn run(root: String) {
     let elapsed = Instant::now().duration_since(start);
 
     println!("Parsing + Compile + Exec: {}ms", elapsed.as_millis());
+
+    Ok(())
 }
 
-static debug_enabled: AtomicBool = AtomicBool::new(false);
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
-fn enable_debug(heap: &mut Heap<Object>, args: &[Value]) -> Value {
-    let enabled = args[1].truthy();
-    debug_enabled.store(enabled, Ordering::SeqCst);
+use zubbers::vm::Callable;
+
+fn enable_debug(context: &mut CallContext<'_>) -> Value {
+    let enabled = context.get_arg(1).truthy();
+    DEBUG_ENABLED.store(enabled, Ordering::SeqCst);
     Value::nil()
 }
 
-fn debug(heap: &mut Heap<Object>, args: &[Value]) -> Value {
-    if debug_enabled.load(Ordering::SeqCst) == false {
+fn debug(context: &mut CallContext<'_>) -> Value {
+    if DEBUG_ENABLED.load(Ordering::SeqCst) == false {
         return Value::nil();
     }
 
-    let data = args[1].with_heap(heap);
+    let data = context.get_arg_with_heap(1);
     let handle = data.item.as_object().unwrap();
 
     let data = match unsafe { handle.get_unchecked() } {
@@ -113,15 +133,53 @@ fn debug(heap: &mut Heap<Object>, args: &[Value]) -> Value {
     let data = data.content.clone();
 
     for arg in data {
-        print!("{:} ", arg.with_heap(heap));
+        print!("{:} ", context.with_heap(arg));
     }
     print!("\n");
     Value::nil()
 }
 
-fn print(heap: &mut Heap<Object>, args: &[Value]) -> Value {
-    let data = args[1].with_heap(heap);
-    let handle = data.item.as_object().unwrap();
+macro_rules! unwrap_as {
+    ($data: expr, $tt: path) => {{
+        let b = unsafe { $data.get_unchecked() };
+
+        let a = match b {
+            $tt(a) => a,
+            _ => {
+                println!("Expected $tt in call!");
+                return Value::nil();
+            }
+        };
+
+        drop(b);
+
+        a
+    }};
+}
+
+fn foreach(context: &mut CallContext<'_>) -> Value {
+    let function = context.get_arg(1).as_object().unwrap();
+
+    let list = context.get_arg_with_heap(2).item.as_object().unwrap();
+    
+    let list = if let Object::List(list) = unsafe {list.get_unchecked()} {
+        list
+    } else {
+        println!("Expected list in call to foreach");
+        return Value::nil();
+    };
+
+    for value in list.content.clone() {
+        let ret_val = context.call(function, vec![value]);
+        println!("Got: {}", context.with_heap(ret_val));
+    }
+
+    Value::nil()
+}
+
+fn print(context: &mut CallContext<'_>) -> Value {
+    let data = context.get_arg(1);
+    let handle = data.as_object().unwrap();
 
     let data = match unsafe { handle.get_unchecked() } {
         Object::List(list) => list,
@@ -134,15 +192,15 @@ fn print(heap: &mut Heap<Object>, args: &[Value]) -> Value {
     let data = data.content.clone();
 
     for arg in data {
-        print!("{:} ", arg.with_heap(heap));
+        print!("{:} ", arg.with_heap(&context.vm.heap));
     }
     print!("\n");
     Value::nil()
 }
 
-fn random(heap: &mut Heap<Object>, args: &[Value]) -> Value {
-    let min = args[1].with_heap(heap).item.as_float() as u64;
-    let max = args[2].with_heap(heap).item.as_float() as u64;
+fn random(context: &mut CallContext<'_>) -> Value {
+    let min = context.get_arg_with_heap(1).item.as_float() as u64;
+    let max = context.get_arg_with_heap(2).item.as_float() as u64;
 
     let number = thread_rng().gen_range(min..max);
 
